@@ -1,6 +1,8 @@
 {
-  "buildCommand": "cd explorer && npm install && npm run build",
-  "outputDirectory": "explorer/dist",
+  "version": 2,
+  "buildCommand": "npm install && npm run build",
+  "outputDirectory": "dist",
+  "installCommand": "npm install",
   "framework": "vite",
-  "installCommand": "cd explorer && npm install"
+  "rootDirectory": "explorer"
 }
