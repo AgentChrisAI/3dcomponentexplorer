@@ -1,0 +1,8 @@
+{
+  "name": "3dcomponentexplorer",
+  "private": true,
+  "scripts": {
+    "build": "cd explorer && npm install && npm run build",
+    "dev": "cd explorer && npm run dev"
+  }
+}
