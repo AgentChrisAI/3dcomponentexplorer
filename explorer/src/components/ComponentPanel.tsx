@@ -63,7 +63,7 @@ export default function ComponentPanel({ repo, onClose }: Props) {
                   <div style={{ padding:12, minHeight:120 }}>
                     {tab === 'preview' && c.sandpackExample && <LivePreview code={c.sandpackExample} dependencies={repo.sandpackConfig?.dependencies || {}} cssImports={repo.sandpackConfig?.cssImports} />}
                     {tab === 'preview' && !c.sandpackExample && <div style={{ color:'var(--text-muted)', fontSize:12, padding:12 }}>No preview available</div>}
-                    {tab === 'code' && <CodeViewer repoId={repo.id} filePath={c.path} />}
+                    {tab === 'code' && <CodeViewer repoId={repo.id} filePath={c.path} fallbackCode={c.sandpackExample} />}
                     {tab === 'props' && (
                       c.props?.length > 0 ? (
                         <div style={{ background:'rgba(255,255,255,0.06)', borderRadius:6, overflow:'hidden' }}>

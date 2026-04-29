@@ -3,39 +3,49 @@ import React, { useEffect, useState } from 'react';
 interface Props {
   repoId: string;
   filePath: string;
+  fallbackCode?: string;
 }
 
-export default function CodeViewer({ repoId, filePath }: Props) {
+export default function CodeViewer({ repoId, filePath, fallbackCode }: Props) {
   const [html, setHtml] = useState<string>('');
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     setLoading(true);
+
+    // Try API first, fall back to inline code
     fetch(`/api/source?repo=${encodeURIComponent(repoId)}&path=${encodeURIComponent(filePath)}`)
-      .then(r => r.json())
+      .then(r => {
+        if (!r.ok) throw new Error('API not available');
+        return r.json();
+      })
       .then(async (data) => {
         if (data.source) {
-          // Use Shiki for highlighting if available, otherwise fall back to pre
           try {
             const { codeToHtml } = await import('shiki');
-            const highlighted = await codeToHtml(data.source, {
-              lang: data.language || 'tsx',
-              theme: 'github-dark',
-            });
+            const highlighted = await codeToHtml(data.source, { lang: data.language || 'tsx', theme: 'github-dark' });
             setHtml(highlighted);
           } catch {
-            setHtml(`<pre style="margin:0;white-space:pre-wrap;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)">${escapeHtml(data.source)}</pre>`);
+            setHtml(wrapPre(data.source));
           }
         } else {
-          setHtml('<p style="color:var(--text-muted)">Source not available</p>');
+          throw new Error('No source');
         }
         setLoading(false);
       })
-      .catch(() => {
-        setHtml('<p style="color:var(--text-muted)">Failed to load source</p>');
+      .catch(async () => {
+        // Fallback: show the sandpackExample or path info
+        const code = fallbackCode || `// Source: ${repoId}/${filePath}\n// API server not running — run locally with: npm run dev`;
+        try {
+          const { codeToHtml } = await import('shiki');
+          const highlighted = await codeToHtml(code, { lang: 'tsx', theme: 'github-dark' });
+          setHtml(highlighted);
+        } catch {
+          setHtml(wrapPre(code));
+        }
         setLoading(false);
       });
-  }, [repoId, filePath]);
+  }, [repoId, filePath, fallbackCode]);
 
   if (loading) return <div style={{ color: 'var(--text-muted)', fontSize: 12, padding: 12 }}>Loading source...</div>;
 
@@ -47,6 +57,7 @@ export default function CodeViewer({ repoId, filePath }: Props) {
   );
 }
 
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+function wrapPre(s: string): string {
+  const escaped = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return `<pre style="margin:0;white-space:pre-wrap;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)">${escaped}</pre>`;
 }
