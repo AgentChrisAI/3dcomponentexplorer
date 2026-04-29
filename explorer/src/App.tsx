@@ -3,6 +3,7 @@ import OrbScene from './scene/OrbScene';
 import ComponentPanel from './components/ComponentPanel';
 import SearchBar from './components/SearchBar';
 import HUD from './components/HUD';
+import AddRepoModal from './components/AddRepoModal';
 
 interface Manifest {
   totalRepos: number;
@@ -15,6 +16,7 @@ export default function App() {
   const [manifest, setManifest] = useState<Manifest | null>(null);
   const [selectedRepo, setSelectedRepo] = useState<any | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [addRepoOpen, setAddRepoOpen] = useState(false);
   const [activeCategory, setActiveCategory] = useState('');
 
   useEffect(() => {
@@ -81,6 +83,19 @@ export default function App() {
           onClose={() => setSearchOpen(false)}
         />
       )}
+      {addRepoOpen && (
+        <AddRepoModal
+          onClose={() => setAddRepoOpen(false)}
+          onSuccess={() => {
+            setAddRepoOpen(false);
+            fetch('/manifest.json').then(r => r.json()).then(setManifest);
+          }}
+        />
+      )}
+      {/* Add Library button */}
+      <div style={{ position:'fixed', bottom:24, left:24, zIndex:50 }}>
+        <button onClick={() => setAddRepoOpen(true)} style={{ background:'transparent', border:'1px solid var(--border-default)', borderRadius:999, padding:'8px 20px', color:'var(--text-secondary)', fontFamily:'var(--font-mono)', fontSize:13, cursor:'pointer' }}>+ Add Library</button>
+      </div>
     </div>
   );
 }

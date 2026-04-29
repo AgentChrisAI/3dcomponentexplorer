@@ -1,4 +1,6 @@
 import React, { useState, useMemo } from 'react';
+import LivePreview from './LivePreview';
+import CodeViewer from './CodeViewer';
 
 interface Repo {
   id: string; name: string; version: string; description: string;
@@ -59,8 +61,9 @@ export default function ComponentPanel({ repo, onClose }: Props) {
                     ))}
                   </div>
                   <div style={{ padding:12, minHeight:120 }}>
-                    {tab === 'preview' && <div style={{ color:'var(--text-secondary)', fontFamily:'var(--font-mono)', fontSize:12, background:'var(--bg-page)', padding:16, borderRadius:6 }}>Live preview (Sandpack) will render here</div>}
-                    {tab === 'code' && <pre style={{ color:'var(--text-secondary)', fontFamily:'var(--font-mono)', fontSize:12, whiteSpace:'pre-wrap', margin:0 }}>{c.sandpackExample || 'No source available'}</pre>}
+                    {tab === 'preview' && c.sandpackExample && <LivePreview code={c.sandpackExample} dependencies={repo.sandpackConfig?.dependencies || {}} cssImports={repo.sandpackConfig?.cssImports} />}
+                    {tab === 'preview' && !c.sandpackExample && <div style={{ color:'var(--text-muted)', fontSize:12, padding:12 }}>No preview available</div>}
+                    {tab === 'code' && <CodeViewer repoId={repo.id} filePath={c.path} />}
                     {tab === 'props' && (
                       c.props?.length > 0 ? (
                         <div style={{ background:'rgba(255,255,255,0.06)', borderRadius:6, overflow:'hidden' }}>

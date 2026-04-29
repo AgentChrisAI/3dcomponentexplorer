@@ -1,264 +1,397 @@
-import { useEffect, useRef, useCallback } from 'react';
-import * as mat from './matMath';
+import { useEffect, useRef } from 'react';
+import type { RefObject } from 'react';
+import type { Repo } from '../types/manifest';
+import {
+  identity, multiply, perspective, lookAt,
+  rotateX, rotateY, translate, scale, invert, transpose,
+} from './matMath';
 import { orbVS, orbFS, ringVS, ringFS, starVS, starFS } from './shaders';
 import { buildSphere, buildRing, buildStarField } from './orbGeometry';
 
-interface Repo {
-  id: string;
-  name: string;
-  orbPosition: [number, number, number];
-  orbSize: number;
-  category: string;
-  components: any[];
-}
-
-interface Callbacks {
+export interface SceneCallbacks {
   onOrbClick: (repo: Repo) => void;
   onOrbHover: (repo: Repo | null) => void;
   activeRepoIds?: string[];
 }
 
-const CAT_BRIGHTNESS: Record<string, number> = {
-  primitives: 1.0, 'styled-system': 0.92, enterprise: 0.85,
-  utility: 0.78, framework: 0.95, collections: 0.70, other: 0.80,
+const BRIGHTNESS: Record<string, number> = {
+  primitives: 1.0,
+  'styled-system': 0.92,
+  enterprise: 0.85,
+  utility: 0.78,
+  framework: 0.95,
+  collections: 0.70,
+  other: 0.80,
 };
 
-function compileShader(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
+// Ring config: [yaw-speed, pitch-base, radius-scale]
+const RING_CFG = [
+  { yawSpeed: 0.20, pitchBase: 0.00, rs: 1.0 },
+  { yawSpeed: 0.13, pitchBase: 1.05, rs: 1.0 },
+  { yawSpeed: 0.09, pitchBase: 2.09, rs: 1.0 },
+] as const;
+
+function compile(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
   const s = gl.createShader(type)!;
   gl.shaderSource(s, src);
   gl.compileShader(s);
-  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-    console.error('Shader compile error:', gl.getShaderInfoLog(s));
-  }
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    console.error('Shader error:', gl.getShaderInfoLog(s));
   return s;
 }
 
-function createProgram(gl: WebGL2RenderingContext, vs: string, fs: string): WebGLProgram {
+function link(gl: WebGL2RenderingContext, vs: string, fs: string): WebGLProgram {
   const p = gl.createProgram()!;
-  gl.attachShader(p, compileShader(gl, gl.VERTEX_SHADER, vs));
-  gl.attachShader(p, compileShader(gl, gl.FRAGMENT_SHADER, fs));
+  gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, fs));
   gl.linkProgram(p);
-  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
-    console.error('Program link error:', gl.getProgramInfoLog(p));
-  }
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    console.error('Link error:', gl.getProgramInfoLog(p));
   return p;
 }
 
-export function useWebGL(
-  canvasRef: React.RefObject<HTMLCanvasElement | null>,
-  repos: Repo[],
-  callbacks: Callbacks
-) {
-  const camRef = useRef({ yaw: 0, pitch: 0.3, dist: 12, dragging: false, lastX: 0, lastY: 0 });
-  const hoveredRef = useRef<Repo | null>(null);
-  const mouseRef = useRef({ x: 0, y: 0 });
+// Project a world point to NDC using the current VP matrix (column-major)
+function projectToNDC(
+  vp: Float32Array,
+  wx: number, wy: number, wz: number,
+): { nx: number; ny: number; behind: boolean } {
+  const w = vp[3]*wx + vp[7]*wy + vp[11]*wz + vp[15];
+  if (w <= 0) return { nx: 0, ny: 0, behind: true };
+  const nx = (vp[0]*wx + vp[4]*wy + vp[8]*wz  + vp[12]) / w;
+  const ny = (vp[1]*wx + vp[5]*wy + vp[9]*wz  + vp[13]) / w;
+  return { nx, ny, behind: false };
+}
 
-  const getEye = useCallback(() => {
-    const c = camRef.current;
-    return [
-      c.dist * Math.sin(c.yaw) * Math.cos(c.pitch),
-      c.dist * Math.sin(c.pitch),
-      c.dist * Math.cos(c.yaw) * Math.cos(c.pitch),
-    ];
-  }, []);
+function pickRepo(
+  repos: Repo[],
+  vp: Float32Array,
+  rect: DOMRect,
+  clientX: number,
+  clientY: number,
+): Repo | null {
+  const mx =  ((clientX - rect.left) / rect.width)  * 2 - 1;
+  const my = -(((clientY - rect.top)  / rect.height) * 2 - 1);
+  let best: Repo | null = null;
+  let bestDist = 0.08; // NDC threshold
+  for (const repo of repos) {
+    const [px, py, pz] = repo.orbPosition;
+    const { nx, ny, behind } = projectToNDC(vp, px, py, pz);
+    if (behind) continue;
+    const d = Math.sqrt((nx - mx) ** 2 + (ny - my) ** 2);
+    if (d < bestDist) { bestDist = d; best = repo; }
+  }
+  return best;
+}
+
+export function useWebGL(
+  canvasRef: RefObject<HTMLCanvasElement | null>,
+  repos: Repo[],
+  callbacks: SceneCallbacks,
+): void {
+  // Keep callbacks stable across renders without restarting the GL loop
+  const cbRef = useRef<SceneCallbacks>(callbacks);
+  cbRef.current = callbacks;
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || repos.length === 0) return;
+    const rawCanvas = canvasRef.current;
+    if (!rawCanvas || repos.length === 0) return;
+    // Assign to new consts AFTER null-guard so TypeScript infers non-null types,
+    // preserving them into nested function closures (known TS narrowing limitation).
+    const canvas = rawCanvas;
 
-    const gl = canvas.getContext('webgl2', { alpha: false, antialias: true });
-    if (!gl) { console.error('No WebGL2'); return; }
+    const rawGl = canvas.getContext('webgl2', { alpha: false, antialias: true });
+    if (!rawGl) { console.error('WebGL2 not supported'); return; }
+    const gl = rawGl;
 
-    // Programs
-    const orbProg = createProgram(gl, orbVS, orbFS);
-    const ringProg = createProgram(gl, ringVS, ringFS);
-    const starProg = createProgram(gl, starVS, starFS);
+    // ── Programs ──────────────────────────────────────────────────────────
+    const orbProg  = link(gl, orbVS,  orbFS);
+    const ringProg = link(gl, ringVS, ringFS);
+    const starProg = link(gl, starVS, starFS);
 
-    // Geometry
-    const sphere = buildSphere(20, 20);
-    const ring = buildRing(48, 1.5, 0.008);
-    const stars = buildStarField(600, 50);
+    // Cache uniform locations (queried once, not per frame)
+    const orbU = {
+      uMVP:      gl.getUniformLocation(orbProg,  'uMVP')!,
+      uModel:    gl.getUniformLocation(orbProg,  'uModel')!,
+      uNormal:   gl.getUniformLocation(orbProg,  'uNormal')!,
+      uTime:     gl.getUniformLocation(orbProg,  'uTime')!,
+      uColor:    gl.getUniformLocation(orbProg,  'uColor')!,
+      uOpacity:  gl.getUniformLocation(orbProg,  'uOpacity')!,
+      uCameraPos:gl.getUniformLocation(orbProg,  'uCameraPos')!,
+    };
+    const ringU = {
+      uMVP:    gl.getUniformLocation(ringProg, 'uMVP')!,
+      uOpacity:gl.getUniformLocation(ringProg, 'uOpacity')!,
+    };
+    const starU = {
+      uMVP: gl.getUniformLocation(starProg, 'uMVP')!,
+    };
 
-    // Sphere buffers
-    const sPos = gl.createBuffer()!; gl.bindBuffer(gl.ARRAY_BUFFER, sPos); gl.bufferData(gl.ARRAY_BUFFER, sphere.positions, gl.STATIC_DRAW);
-    const sNorm = gl.createBuffer()!; gl.bindBuffer(gl.ARRAY_BUFFER, sNorm); gl.bufferData(gl.ARRAY_BUFFER, sphere.normals, gl.STATIC_DRAW);
-    const sIdx = gl.createBuffer()!; gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, sIdx); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, sphere.indices, gl.STATIC_DRAW);
+    // ── Geometry ──────────────────────────────────────────────────────────
+    const sphere = buildSphere(22, 22);
+    const ring   = buildRing(56, 1.5, 0.007);
+    const stars  = buildStarField(600, 50);
 
-    // Ring buffers
-    const rPos = gl.createBuffer()!; gl.bindBuffer(gl.ARRAY_BUFFER, rPos); gl.bufferData(gl.ARRAY_BUFFER, ring.positions, gl.STATIC_DRAW);
-    const rIdx = gl.createBuffer()!; gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, rIdx); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, ring.indices, gl.STATIC_DRAW);
+    function buf(data: Float32Array | Uint16Array, target: number): WebGLBuffer {
+      const b = gl.createBuffer()!;
+      gl.bindBuffer(target, b);
+      gl.bufferData(target, data, gl.STATIC_DRAW);
+      return b;
+    }
 
-    // Star buffers
-    const stPos = gl.createBuffer()!; gl.bindBuffer(gl.ARRAY_BUFFER, stPos); gl.bufferData(gl.ARRAY_BUFFER, stars.positions, gl.STATIC_DRAW);
-    const stSize = gl.createBuffer()!; gl.bindBuffer(gl.ARRAY_BUFFER, stSize); gl.bufferData(gl.ARRAY_BUFFER, stars.sizes, gl.STATIC_DRAW);
+    const bSpherePos  = buf(sphere.positions, gl.ARRAY_BUFFER);
+    const bSphereNorm = buf(sphere.normals,   gl.ARRAY_BUFFER);
+    const bSphereIdx  = buf(sphere.indices,   gl.ELEMENT_ARRAY_BUFFER);
+    const bRingPos    = buf(ring.positions,   gl.ARRAY_BUFFER);
+    const bRingIdx    = buf(ring.indices,     gl.ELEMENT_ARRAY_BUFFER);
+    const bStarPos    = buf(stars.positions,  gl.ARRAY_BUFFER);
+    const bStarSize   = buf(stars.sizes,      gl.ARRAY_BUFFER);
 
-    // Orb VAO
-    const orbVAO = gl.createVertexArray()!;
-    gl.bindVertexArray(orbVAO);
-    const aPosLoc = gl.getAttribLocation(orbProg, 'aPosition');
-    const aNormLoc = gl.getAttribLocation(orbProg, 'aNormal');
-    gl.bindBuffer(gl.ARRAY_BUFFER, sPos); gl.enableVertexAttribArray(aPosLoc); gl.vertexAttribPointer(aPosLoc, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, sNorm); gl.enableVertexAttribArray(aNormLoc); gl.vertexAttribPointer(aNormLoc, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, sIdx);
-    gl.bindVertexArray(null);
+    // ── VAOs ──────────────────────────────────────────────────────────────
+    function makeVAO(setup: () => void): WebGLVertexArrayObject {
+      const v = gl.createVertexArray()!;
+      gl.bindVertexArray(v);
+      setup();
+      gl.bindVertexArray(null);
+      return v;
+    }
 
-    // Ring VAO
-    const ringVAO = gl.createVertexArray()!;
-    gl.bindVertexArray(ringVAO);
-    const rPosLoc = gl.getAttribLocation(ringProg, 'aPosition');
-    gl.bindBuffer(gl.ARRAY_BUFFER, rPos); gl.enableVertexAttribArray(rPosLoc); gl.vertexAttribPointer(rPosLoc, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, rIdx);
-    gl.bindVertexArray(null);
+    const vaoOrb = makeVAO(() => {
+      const aPos  = gl.getAttribLocation(orbProg, 'aPosition');
+      const aNorm = gl.getAttribLocation(orbProg, 'aNormal');
+      gl.bindBuffer(gl.ARRAY_BUFFER, bSpherePos);
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, bSphereNorm);
+      gl.enableVertexAttribArray(aNorm);
+      gl.vertexAttribPointer(aNorm, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bSphereIdx);
+    });
 
-    // Star VAO
-    const starVAO = gl.createVertexArray()!;
-    gl.bindVertexArray(starVAO);
-    const stPosLoc = gl.getAttribLocation(starProg, 'aPosition');
-    const stSizeLoc = gl.getAttribLocation(starProg, 'aSize');
-    gl.bindBuffer(gl.ARRAY_BUFFER, stPos); gl.enableVertexAttribArray(stPosLoc); gl.vertexAttribPointer(stPosLoc, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, stSize); gl.enableVertexAttribArray(stSizeLoc); gl.vertexAttribPointer(stSizeLoc, 1, gl.FLOAT, false, 0, 0);
-    gl.bindVertexArray(null);
+    const vaoRing = makeVAO(() => {
+      const aPos = gl.getAttribLocation(ringProg, 'aPosition');
+      gl.bindBuffer(gl.ARRAY_BUFFER, bRingPos);
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bRingIdx);
+    });
 
+    const vaoStar = makeVAO(() => {
+      const aPos  = gl.getAttribLocation(starProg, 'aPosition');
+      const aSize = gl.getAttribLocation(starProg, 'aSize');
+      gl.bindBuffer(gl.ARRAY_BUFFER, bStarPos);
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, bStarSize);
+      gl.enableVertexAttribArray(aSize);
+      gl.vertexAttribPointer(aSize, 1, gl.FLOAT, false, 0, 0);
+    });
+
+    // ── Camera state ──────────────────────────────────────────────────────
+    let yaw = 0.3, pitch = 0.25, dist = 22;
+    let dragging = false, dragStartX = 0, dragStartY = 0;
+    let lastMoveX = 0, lastMoveY = 0;
+    let prevHovered: Repo | null = null;
+
+    function eyePos(): [number, number, number] {
+      const cosPitch = Math.cos(pitch);
+      return [
+        dist * cosPitch * Math.sin(yaw),
+        dist * Math.sin(pitch),
+        dist * cosPitch * Math.cos(yaw),
+      ];
+    }
+
+    function getVP(w: number, h: number): Float32Array {
+      const eye  = eyePos();
+      const proj = perspective(Math.PI / 4, w / h, 0.1, 120);
+      const view = lookAt(eye, [0, 0, 0], [0, 1, 0]);
+      return multiply(proj, view);
+    }
+
+    // ── Mouse handlers ────────────────────────────────────────────────────
+    const onDown = (e: MouseEvent) => {
+      dragging = true;
+      dragStartX = lastMoveX = e.clientX;
+      dragStartY = lastMoveY = e.clientY;
+    };
+
+    const onUp = (e: MouseEvent) => {
+      dragging = false;
+      // Treat as click if barely moved
+      const moved = Math.abs(e.clientX - dragStartX) + Math.abs(e.clientY - dragStartY);
+      if (moved < 4) {
+        const rect = canvas.getBoundingClientRect();
+        const vp   = getVP(rect.width, rect.height);
+        const hit  = pickRepo(repos, vp, rect, e.clientX, e.clientY);
+        if (hit) cbRef.current.onOrbClick(hit);
+      }
+    };
+
+    const onMove = (e: MouseEvent) => {
+      if (dragging) {
+        const dx = e.clientX - lastMoveX;
+        const dy = e.clientY - lastMoveY;
+        yaw   += dx * 0.005;
+        pitch  = Math.max(-1.2, Math.min(1.2, pitch + dy * 0.005));
+        lastMoveX = e.clientX;
+        lastMoveY = e.clientY;
+      } else {
+        // Hover detection
+        const rect = canvas.getBoundingClientRect();
+        const vp   = getVP(rect.width, rect.height);
+        const hit  = pickRepo(repos, vp, rect, e.clientX, e.clientY);
+        if (hit !== prevHovered) {
+          prevHovered = hit;
+          cbRef.current.onOrbHover(hit);
+          canvas.style.cursor = hit ? 'pointer' : 'default';
+        }
+      }
+    };
+
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      dist = Math.max(4, Math.min(60, dist + e.deltaY * 0.03));
+    };
+
+    const onLeave = () => {
+      if (prevHovered) {
+        prevHovered = null;
+        cbRef.current.onOrbHover(null);
+        canvas.style.cursor = 'default';
+      }
+    };
+
+    canvas.addEventListener('mousedown', onDown);
+    canvas.addEventListener('mouseup',   onUp);
+    canvas.addEventListener('mousemove', onMove);
+    canvas.addEventListener('mouseleave',onLeave);
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+
+    // ── Render loop ───────────────────────────────────────────────────────
     gl.enable(gl.DEPTH_TEST);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.clearColor(0, 0, 0, 1);
 
-    let animId = 0;
-    const startTime = performance.now();
+    const normalMat3 = new Float32Array(9); // computed per orb
+
+    let rafId = 0;
+    const t0 = performance.now();
 
     function render() {
-      const w = canvas!.clientWidth; const h = canvas!.clientHeight;
-      if (canvas!.width !== w || canvas!.height !== h) { canvas!.width = w; canvas!.height = h; }
-      gl!.viewport(0, 0, w, h);
-      gl!.clear(gl!.COLOR_BUFFER_BIT | gl!.DEPTH_BUFFER_BIT);
+      rafId = requestAnimationFrame(render);
 
-      const time = (performance.now() - startTime) / 1000;
-      const eye = getEye();
-      const proj = mat.perspective(Math.PI / 4, w / h, 0.1, 100);
-      const view = mat.lookAt(eye, [0, 0, 0], [0, 1, 0]);
-      const vp = mat.multiply(proj, view);
-
-      // Stars
-      gl!.useProgram(starProg);
-      gl!.bindVertexArray(starVAO);
-      gl!.uniformMatrix4fv(gl!.getUniformLocation(starProg, 'uMVP'), false, vp);
-      gl!.drawArrays(gl!.POINTS, 0, 600);
-
-      // Orbs
-      gl!.useProgram(orbProg);
-      gl!.uniform1f(gl!.getUniformLocation(orbProg, 'uTime'), time);
-      gl!.uniform3fv(gl!.getUniformLocation(orbProg, 'uCameraPos'), new Float32Array(eye));
-
-      const active = callbacks.activeRepoIds;
-
-      for (const repo of repos) {
-        const isActive = !active || active.length === 0 || active.includes(repo.id);
-        const opacity = isActive ? 1.0 : 0.08;
-        const b = CAT_BRIGHTNESS[repo.category] ?? 0.8;
-
-        const model = mat.scale(
-          mat.translate(mat.identity(), repo.orbPosition),
-          repo.orbSize * 0.4
-        );
-        const mvp = mat.multiply(vp, model);
-        const normalMat = new Float32Array(9);
-        const inv = mat.invert(model);
-        const t = mat.transpose(inv);
-        normalMat[0]=t[0]; normalMat[1]=t[1]; normalMat[2]=t[2];
-        normalMat[3]=t[4]; normalMat[4]=t[5]; normalMat[5]=t[6];
-        normalMat[6]=t[8]; normalMat[7]=t[9]; normalMat[8]=t[10];
-
-        gl!.bindVertexArray(orbVAO);
-        gl!.uniformMatrix4fv(gl!.getUniformLocation(orbProg, 'uMVP'), false, mvp);
-        gl!.uniformMatrix4fv(gl!.getUniformLocation(orbProg, 'uModel'), false, model);
-        gl!.uniformMatrix3fv(gl!.getUniformLocation(orbProg, 'uNormal'), false, normalMat);
-        gl!.uniform3f(gl!.getUniformLocation(orbProg, 'uColor'), b, b, b);
-        gl!.uniform1f(gl!.getUniformLocation(orbProg, 'uOpacity'), opacity);
-        gl!.drawElements(gl!.TRIANGLES, sphere.indices.length, gl!.UNSIGNED_SHORT, 0);
-
-        // 3 rings per orb
-        gl!.useProgram(ringProg);
-        for (let ri = 0; ri < 3; ri++) {
-          const ringModel = mat.rotateX(
-            mat.rotateY(
-              mat.translate(mat.identity(), repo.orbPosition),
-              time * 0.3 + ri * 2.09
-            ),
-            ri * 1.05 + time * 0.15
-          );
-          const ringMvp = mat.multiply(vp, ringModel);
-          gl!.bindVertexArray(ringVAO);
-          gl!.uniformMatrix4fv(gl!.getUniformLocation(ringProg, 'uMVP'), false, ringMvp);
-          gl!.uniform1f(gl!.getUniformLocation(ringProg, 'uOpacity'), opacity);
-          gl!.drawElements(gl!.TRIANGLES, ring.indices.length, gl!.UNSIGNED_SHORT, 0);
-        }
-        gl!.useProgram(orbProg);
+      // Sync canvas size to CSS
+      const cw = canvas.clientWidth;
+      const ch = canvas.clientHeight;
+      if (canvas.width !== cw || canvas.height !== ch) {
+        canvas.width  = cw;
+        canvas.height = ch;
+        gl.viewport(0, 0, cw, ch);
       }
 
-      animId = requestAnimationFrame(render);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+      const time = (performance.now() - t0) / 1000;
+      const eye  = eyePos();
+      const vp   = getVP(cw, ch);
+
+      // Active set
+      const activeIds = cbRef.current.activeRepoIds;
+      const hasFilter = activeIds && activeIds.length > 0;
+      const activeSet = hasFilter ? new Set(activeIds) : null;
+
+      // ── Stars (depthMask off — pure background) ────────────────────────
+      gl.depthMask(false);
+      gl.useProgram(starProg);
+      gl.bindVertexArray(vaoStar);
+      gl.uniformMatrix4fv(starU.uMVP, false, vp);
+      gl.drawArrays(gl.POINTS, 0, 600);
+
+      // ── Orbs ──────────────────────────────────────────────────────────
+      gl.depthMask(true);
+      gl.useProgram(orbProg);
+      gl.uniform1f(orbU.uTime, time);
+      gl.uniform3f(orbU.uCameraPos, eye[0], eye[1], eye[2]);
+
+      for (const repo of repos) {
+        const opacity = !activeSet || activeSet.has(repo.id) ? 1.0 : 0.08;
+        const b = BRIGHTNESS[repo.category] ?? 0.80;
+
+        const s = Math.max(0.01, repo.orbSize) * 0.5;
+        const model = scale(
+          translate(identity(), repo.orbPosition),
+          s,
+        );
+        const mvp = multiply(vp, model);
+
+        // Normal matrix: upper-left 3x3 of transpose(invert(model))
+        const ti = transpose(invert(model));
+        normalMat3[0]=ti[0]; normalMat3[1]=ti[1]; normalMat3[2]=ti[2];
+        normalMat3[3]=ti[4]; normalMat3[4]=ti[5]; normalMat3[5]=ti[6];
+        normalMat3[6]=ti[8]; normalMat3[7]=ti[9]; normalMat3[8]=ti[10];
+
+        gl.bindVertexArray(vaoOrb);
+        gl.uniformMatrix4fv(orbU.uMVP,    false, mvp);
+        gl.uniformMatrix4fv(orbU.uModel,  false, model);
+        gl.uniformMatrix3fv(orbU.uNormal, false, normalMat3);
+        gl.uniform3f(orbU.uColor,   b, b, b);
+        gl.uniform1f(orbU.uOpacity, opacity);
+        gl.drawElements(gl.TRIANGLES, sphere.indices.length, gl.UNSIGNED_SHORT, 0);
+
+        // ── Rings for this orb ─────────────────────────────────────────
+        gl.depthMask(false);
+        gl.useProgram(ringProg);
+        gl.bindVertexArray(vaoRing);
+        gl.uniform1f(ringU.uOpacity, opacity);
+
+        for (const cfg of RING_CFG) {
+          const ringModel = rotateX(
+            rotateY(
+              translate(identity(), repo.orbPosition),
+              time * cfg.yawSpeed,
+            ),
+            cfg.pitchBase + time * 0.08,
+          );
+          // Scale ring by orb size
+          const scaledRingModel = scale(ringModel, s);
+          const ringMVP = multiply(vp, scaledRingModel);
+          gl.uniformMatrix4fv(ringU.uMVP, false, ringMVP);
+          gl.drawElements(gl.TRIANGLES, ring.indices.length, gl.UNSIGNED_SHORT, 0);
+        }
+
+        gl.depthMask(true);
+        gl.useProgram(orbProg);
+        gl.uniform1f(orbU.uTime, time);
+        gl.uniform3f(orbU.uCameraPos, eye[0], eye[1], eye[2]);
+      }
+
+      gl.bindVertexArray(null);
     }
 
-    // Mouse events
-    const onDown = (e: MouseEvent) => { camRef.current.dragging = true; camRef.current.lastX = e.clientX; camRef.current.lastY = e.clientY; };
-    const onUp = () => { camRef.current.dragging = false; };
-    const onMove = (e: MouseEvent) => {
-      mouseRef.current = { x: e.clientX, y: e.clientY };
-      if (!camRef.current.dragging) return;
-      const dx = e.clientX - camRef.current.lastX;
-      const dy = e.clientY - camRef.current.lastY;
-      camRef.current.yaw += dx * 0.005;
-      camRef.current.pitch = Math.max(-1.2, Math.min(1.2, camRef.current.pitch + dy * 0.005));
-      camRef.current.lastX = e.clientX;
-      camRef.current.lastY = e.clientY;
-    };
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      camRef.current.dist = Math.max(3, Math.min(30, camRef.current.dist + e.deltaY * 0.01));
-    };
-    const onClick = (e: MouseEvent) => {
-      // Simple raycast: project each orb center to screen, find closest to mouse
-      const rect = canvas!.getBoundingClientRect();
-      const mx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      const my = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
-      const eye = getEye();
-      const proj = mat.perspective(Math.PI / 4, rect.width / rect.height, 0.1, 100);
-      const view = mat.lookAt(eye, [0, 0, 0], [0, 1, 0]);
-      const vp = mat.multiply(proj, view);
+    render();
 
-      let closest: Repo | null = null;
-      let closestDist = 0.06; // threshold in NDC
-
-      for (const repo of repos) {
-        const p = repo.orbPosition;
-        const clip = new Float32Array(4);
-        clip[0] = vp[0]*p[0] + vp[4]*p[1] + vp[8]*p[2] + vp[12];
-        clip[1] = vp[1]*p[0] + vp[5]*p[1] + vp[9]*p[2] + vp[13];
-        clip[3] = vp[3]*p[0] + vp[7]*p[1] + vp[11]*p[2] + vp[15];
-        if (clip[3] <= 0) continue;
-        const nx = clip[0] / clip[3];
-        const ny = clip[1] / clip[3];
-        const d = Math.sqrt((nx - mx) ** 2 + (ny - my) ** 2);
-        if (d < closestDist) { closestDist = d; closest = repo; }
-      }
-      if (closest) callbacks.onOrbClick(closest);
-    };
-
-    canvas.addEventListener('mousedown', onDown);
-    canvas.addEventListener('mouseup', onUp);
-    canvas.addEventListener('mousemove', onMove);
-    canvas.addEventListener('wheel', onWheel, { passive: false });
-    canvas.addEventListener('click', onClick);
-
-    animId = requestAnimationFrame(render);
-
+    // ── Cleanup ───────────────────────────────────────────────────────────
     return () => {
-      cancelAnimationFrame(animId);
-      canvas.removeEventListener('mousedown', onDown);
-      canvas.removeEventListener('mouseup', onUp);
-      canvas.removeEventListener('mousemove', onMove);
-      canvas.removeEventListener('wheel', onWheel);
-      canvas.removeEventListener('click', onClick);
+      cancelAnimationFrame(rafId);
+      canvas.removeEventListener('mousedown',  onDown);
+      canvas.removeEventListener('mouseup',    onUp);
+      canvas.removeEventListener('mousemove',  onMove);
+      canvas.removeEventListener('mouseleave', onLeave);
+      canvas.removeEventListener('wheel',      onWheel);
+
+      gl.deleteProgram(orbProg);
+      gl.deleteProgram(ringProg);
+      gl.deleteProgram(starProg);
+      gl.deleteVertexArray(vaoOrb);
+      gl.deleteVertexArray(vaoRing);
+      gl.deleteVertexArray(vaoStar);
+      for (const b of [bSpherePos, bSphereNorm, bSphereIdx, bRingPos, bRingIdx,
+                        bStarPos, bStarSize]) {
+        gl.deleteBuffer(b);
+      }
     };
-  }, [canvasRef, repos, callbacks, getEye]);
+  // repos is the only real dep — callbacks are tracked via cbRef
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasRef, repos]);
 }
