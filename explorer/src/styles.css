@@ -1,0 +1,26 @@
+@font-face { font-family: 'Syne'; src: local('Syne'), local('sans-serif'); }
+:root {
+  --bg-page: #000000;
+  --bg-surface: #0a0a0a;
+  --bg-card: #111111;
+  --bg-hover: #161616;
+  --bg-selected: #1a1a1a;
+  --bg-input: #0d0d0d;
+  --border-subtle: rgba(255,255,255,0.06);
+  --border-default: rgba(255,255,255,0.12);
+  --border-strong: rgba(255,255,255,0.22);
+  --text-primary: #ffffff;
+  --text-secondary: rgba(255,255,255,0.55);
+  --text-muted: rgba(255,255,255,0.32);
+  --text-inverse: #000000;
+  --accent: #ffffff;
+  --accent-text: #000000;
+  --status-online: #00d26a;
+  --font-base: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif;
+  --font-mono: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+  --font-display: 'Syne', sans-serif;
+}
+html, body, #root { height: 100%; margin: 0; background: #000; }
+body { font-family: var(--font-base); color: #fff; }
+" 
+,file_path”:"/home/christopher/.openclaw/workspace/3dcomponentexplorer/explorer/src/styles.css"
