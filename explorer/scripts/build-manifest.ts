@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { discoverRepo } from './discover.ts';
+import { CURATED } from '../src/data/curatedComponents.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -99,8 +100,14 @@ async function buildManifest() {
     }
 
     const category = CATEGORY_MAP[repoId] || 'other';
-    const sandpackConfig = KNOWN_SANDPACK[repoId] || { dependencies: {}, entry: 'index' };
     const existingEntry = existingManifest?.repos?.find((r: any) => r.id === repoId);
+
+    // Use curated data if available, otherwise fall back to auto-discovery
+    const curated = CURATED[repoId];
+    const components = curated ? curated.components : discovered.components;
+    const sandpackConfig = curated ? curated.sandpackConfig : (KNOWN_SANDPACK[repoId] || { dependencies: {}, entry: 'index' });
+
+    console.log(`  → ${components.length} components (${curated ? 'CURATED' : 'auto-discovered'})`);
 
     repos.push({
       id: repoId,
@@ -110,9 +117,9 @@ async function buildManifest() {
       category,
       description: discovered.description || '',
       version: discovered.version || 'unknown',
-      components: discovered.components,
+      components,
       orbPosition: generateOrbPosition(idx, lines.length),
-      orbSize: parseFloat((0.7 + Math.min(discovered.components.length / 40, 0.6)).toFixed(2)),
+      orbSize: parseFloat((0.7 + Math.min(components.length / 40, 0.6)).toFixed(2)),
       sandpackConfig,
       lastDiscovered: new Date().toISOString(),
       addedAt: existingEntry?.addedAt || new Date().toISOString(),
